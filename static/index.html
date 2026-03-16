@@ -77,6 +77,39 @@
     #chat::-webkit-scrollbar { width: 5px; }
     #chat::-webkit-scrollbar-thumb { background: #2a2a40; border-radius: 4px; }
 
+    /* ── Sign panel ───────────────────────────────── */
+    #sign-panel {
+      padding: 10px 16px;
+      border-bottom: 1px solid #252540;
+      background: #111126;
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 12px;
+      align-items: start;
+      flex-shrink: 0;
+    }
+    #cam-video {
+      width: 220px;
+      height: 160px;
+      border-radius: 10px;
+      background: #090916;
+      border: 1px solid #252540;
+      object-fit: cover;
+    }
+    .sign-controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .sign-btn {
+      border: 1px solid #2f3a6a;
+      background: #1a2550;
+      color: #dbe4ff;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .sign-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .sign-text { font-size: 13px; color: #b8c0e8; line-height: 1.45; }
+    .sign-text b { color: #fff; }
+
     .msg {
       display: flex;
       gap: 10px;
@@ -212,6 +245,18 @@
   </div>
 </header>
 
+<div id="sign-panel">
+  <video id="cam-video" autoplay playsinline muted></video>
+  <div>
+    <div class="sign-controls">
+      <button id="toggle-cam-btn" class="sign-btn">Start Camera</button>
+    </div>
+    <div class="sign-text"><b>Recognized:</b> <span id="recognized-text">—</span></div>
+    <div class="sign-text"><b>Live:</b> <span id="live-text">—</span></div>
+    <div class="sign-text"><b>Gemini:</b> <span id="sign-gemini-text">—</span></div>
+  </div>
+</div>
+
 <div id="chat"></div>
 
 <div id="input-bar">
@@ -229,12 +274,24 @@
   const statusDot = document.getElementById('status-dot');
   const statusTxt = document.getElementById('status-text');
   const modelTag  = document.getElementById('model-tag');
+  const camVideo  = document.getElementById('cam-video');
+  const toggleCamBtn = document.getElementById('toggle-cam-btn');
+  const recognizedTextEl = document.getElementById('recognized-text');
+  const liveTextEl = document.getElementById('live-text');
+  const signGeminiTextEl = document.getElementById('sign-gemini-text');
 
   // ── State ─────────────────────────────────────────────────────────────────
   let ws               = null;
+  let signWs           = null;
   let curBubble        = null;   // current Gemini bubble element
   let activeTurn       = null;   // { bubble, waves, pending }
   let turnTimeout      = null;
+  let cameraStream     = null;
+  let frameTimer       = null;
+  const frameCanvas    = document.createElement('canvas');
+  frameCanvas.width = 320;
+  frameCanvas.height = 240;
+  const frameCtx = frameCanvas.getContext('2d');
 
   // ── Audio ─────────────────────────────────────────────────────────────────
   let audioCtx      = null;
@@ -295,6 +352,14 @@
     const el = document.createElement('div');
     el.className = 'msg user';
     el.innerHTML = `<div class="avatar">U</div><div class="bubble">${esc(text)}</div>`;
+    chat.appendChild(el);
+    scrollDown();
+  }
+
+  function addGeminiMessage(text) {
+    const el = document.createElement('div');
+    el.className = 'msg gemini';
+    el.innerHTML = `<div class="avatar">G</div><div class="bubble">${esc(text)}</div>`;
     chat.appendChild(el);
     scrollDown();
   }
@@ -453,6 +518,116 @@
   sendBtn.addEventListener('click', send);
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+
+  // ── Sign pipeline (webcam + ws-sign) ─────────────────────────────────────
+  async function startCamera() {
+    if (cameraStream) return;
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+      camVideo.srcObject = cameraStream;
+      toggleCamBtn.textContent = 'Stop Camera';
+      connectSignPipeline();
+    } catch (e) {
+      recognizedTextEl.textContent = 'Camera permission denied or unavailable.';
+      liveTextEl.textContent = '—';
+    }
+  }
+
+  function stopCamera() {
+    if (!cameraStream) return;
+    stopSignPipeline();
+    cameraStream.getTracks().forEach(t => t.stop());
+    cameraStream = null;
+    camVideo.srcObject = null;
+    toggleCamBtn.textContent = 'Start Camera';
+    recognizedTextEl.textContent = '—';
+    liveTextEl.textContent = '—';
+    signGeminiTextEl.textContent = '—';
+  }
+
+  function connectSignPipeline() {
+    if (!cameraStream || signWs) return;
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    signWs = new WebSocket(`${proto}//${location.host}/ws-sign`);
+
+    signWs.onopen = () => {
+      recognizedTextEl.textContent = 'Streaming…';
+      liveTextEl.textContent = 'Listening…';
+      signGeminiTextEl.textContent = 'Waiting…';
+
+      frameTimer = setInterval(() => {
+        if (!signWs || signWs.readyState !== WebSocket.OPEN || !cameraStream) return;
+        frameCtx.drawImage(camVideo, 0, 0, frameCanvas.width, frameCanvas.height);
+        const dataUrl = frameCanvas.toDataURL('image/jpeg', 0.65);
+        const b64 = dataUrl.split(',')[1] || '';
+        signWs.send(JSON.stringify({ type: 'frame', frame: b64 }));
+      }, 100);
+    };
+
+    signWs.onmessage = ({ data }) => {
+      const msg = JSON.parse(data);
+      if (msg.type === 'recognized_text') {
+        recognizedTextEl.textContent = msg.text || '—';
+        liveTextEl.textContent = msg.text || '—';
+      } else if (msg.type === 'live_text') {
+        liveTextEl.textContent = msg.text || '—';
+      } else if (msg.type === 'gemini_text') {
+        signGeminiTextEl.textContent = msg.text || '—';
+        addGeminiMessage(msg.text || '');
+      } else if (msg.type === 'audio') {
+        playPCMChunk(msg.data, msg.mime || 'audio/pcm;rate=24000', null);
+      } else if (msg.type === 'error') {
+        signGeminiTextEl.textContent = 'Error: ' + (msg.message || 'Unknown');
+      }
+    };
+
+    signWs.onclose = () => {
+      if (frameTimer) {
+        clearInterval(frameTimer);
+        frameTimer = null;
+      }
+      signWs = null;
+      // If camera is still on, reconnect automatically for natural UX.
+      if (cameraStream) {
+        recognizedTextEl.textContent = 'Reconnecting…';
+        liveTextEl.textContent = 'Reconnecting…';
+        setTimeout(() => {
+          if (cameraStream && !signWs) connectSignPipeline();
+        }, 400);
+      }
+    };
+  }
+
+  function stopSignPipeline() {
+    if (frameTimer) {
+      clearInterval(frameTimer);
+      frameTimer = null;
+    }
+    if (signWs) {
+      if (signWs.readyState === WebSocket.OPEN) signWs.send(JSON.stringify({ type: 'stop' }));
+      signWs.close();
+      signWs = null;
+    }
+  }
+
+  toggleCamBtn.addEventListener('click', () => {
+    if (cameraStream) stopCamera();
+    else startCamera();
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopSignPipeline();
+    } else if (cameraStream && !signWs) {
+      connectSignPipeline();
+    }
+  });
+
+  window.addEventListener('beforeunload', () => {
+    stopSignPipeline();
+    stopCamera();
   });
 
   // ── Boot ──────────────────────────────────────────────────────────────────

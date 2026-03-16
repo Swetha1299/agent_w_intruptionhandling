@@ -2,9 +2,13 @@ import asyncio
 import base64
 import logging
 import os
+import sys
 import time
+from collections import deque
 from pathlib import Path
 
+import cv2
+import numpy as np
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -12,6 +16,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from sign_pipeline.gemini_client import GeminiNativeAudioClient
+from sign_pipeline.landmarks import MultiStreamLandmarkExtractor
+from sign_pipeline.recognizer import FusedTemporalTransformerRecognizer
+from sign_pipeline.stabilizer import TemporalSentenceStabilizer
+from sign_pipeline.text_converter import SignTextConverter
 
 
 # ── Environment ────────────────────────────────────────────────────────────────
@@ -167,6 +181,121 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "message": str(exc)})
         except Exception:
             pass
+
+
+@app.websocket("/ws-sign")
+async def websocket_sign_pipeline(websocket: WebSocket) -> None:
+    """Frontend-driven sign pipeline websocket.
+
+    Expects JSON messages:
+      {"type": "frame", "frame": "<base64-jpeg>"}
+      {"type": "stop"}
+    Emits JSON messages:
+      {"type": "sign_ready"}
+      {"type": "recognized_text", "text": "..."}
+      {"type": "gemini_text", "text": "..."}
+      {"type": "audio", "data": "<base64-bytes>", "mime": "audio/pcm;rate=24000"}
+      {"type": "error", "message": "..."}
+    """
+    await websocket.accept()
+    logger.info("Sign pipeline client connected")
+
+    extractor = MultiStreamLandmarkExtractor(enable_face=False)
+    recognizer = FusedTemporalTransformerRecognizer(window_size=12)
+    converter = SignTextConverter()
+    stabilizer = TemporalSentenceStabilizer(converter=converter)
+    sign_gemini = GeminiNativeAudioClient(model=MODEL, api_key=API_KEY)
+
+    window = deque(maxlen=12)
+    last_recognized = ""
+    last_live = ""
+    last_gemini_prompt = ""
+    last_gemini_at = 0.0
+    gemini_task: asyncio.Task | None = None
+
+    try:
+        await websocket.send_json({"type": "sign_ready"})
+
+        while True:
+            payload = None
+            try:
+                payload = await asyncio.wait_for(websocket.receive_json(), timeout=0.05)
+            except asyncio.TimeoutError:
+                payload = None
+
+            if payload:
+                msg_type = payload.get("type")
+                if msg_type == "stop":
+                    break
+
+                if msg_type == "frame":
+                    b64_frame = payload.get("frame", "")
+                    if b64_frame:
+                        try:
+                            frame_bytes = base64.b64decode(b64_frame)
+                            img_arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+                            frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+                        except Exception:
+                            frame = None
+
+                        if frame is not None:
+                            landmark_frame = extractor.extract(frame)
+                            window.append(landmark_frame)
+                            tokens = recognizer.predict_tokens(tuple(window))
+                            stabilized = stabilizer.update(tokens, landmark_frame)
+                            recognized_text = stabilized.settled_text
+                            live_text = stabilized.live_text
+
+                            if live_text and live_text != last_live:
+                                last_live = live_text
+                                await websocket.send_json({"type": "live_text", "text": live_text})
+
+                            if recognized_text and recognized_text != last_recognized:
+                                last_recognized = recognized_text
+                                await websocket.send_json({"type": "recognized_text", "text": recognized_text})
+
+                            now = time.monotonic()
+                            if (
+                                recognized_text
+                                and recognized_text != last_gemini_prompt
+                                and (now - last_gemini_at) >= 0.4
+                                and gemini_task is None
+                            ):
+                                last_gemini_prompt = recognized_text
+                                last_gemini_at = now
+                                gemini_task = asyncio.create_task(sign_gemini.generate(recognized_text, timeout_sec=15.0))
+
+            if gemini_task and gemini_task.done():
+                try:
+                    result = gemini_task.result()
+                    if result.text:
+                        await websocket.send_json({"type": "gemini_text", "text": result.text})
+                    if result.audio_bytes:
+                        await websocket.send_json(
+                            {
+                                "type": "audio",
+                                "data": base64.b64encode(result.audio_bytes).decode(),
+                                "mime": result.audio_mime_type,
+                            }
+                        )
+                except Exception as exc:
+                    logger.exception("Sign Gemini task failed: %s", exc)
+                    await websocket.send_json({"type": "error", "message": str(exc)})
+                finally:
+                    gemini_task = None
+
+    except WebSocketDisconnect:
+        logger.info("Sign pipeline client disconnected")
+    except Exception as exc:
+        logger.exception("Sign pipeline session error: %s", exc)
+        try:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
+    finally:
+        if gemini_task and not gemini_task.done():
+            gemini_task.cancel()
+        extractor.close()
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
