@@ -127,14 +127,22 @@ async def main():
             printed_text = False
             audio_chunks: list[bytes] = []
             audio_mime = "audio/pcm;rate=24000"
+            interrupted = False
             try:
                 print("Gemini: ", end="", flush=True)
                 async for response in session.receive():
+                    server_content = getattr(response, "server_content", None)
+                    
+                    # Check for interruption FIRST, before processing anything
+                    if server_content and getattr(server_content, "interruption", None):
+                        logger.info("Interruption detected. Stopping response.")
+                        interrupted = True
+                        break
+
                     for chunk in iter_server_text(response):
                         print(chunk, end="", flush=True)
                         printed_text = True
 
-                    server_content = getattr(response, "server_content", None)
                     if not server_content:
                         continue
 
@@ -155,7 +163,7 @@ async def main():
                         break
 
                 # Fallback: send collected audio to generate_content for transcription
-                if not printed_text and audio_chunks:
+                if not printed_text and audio_chunks and not interrupted:
                     try:
                         wav_data = pcm_to_wav(b"".join(audio_chunks), audio_mime)
                         tr = await client.aio.models.generate_content(
@@ -172,8 +180,10 @@ async def main():
                     except Exception as te:
                         logger.warning("Fallback transcription failed: %s", te)
 
-                if not printed_text:
+                if not printed_text and not interrupted:
                     print("[No transcription available]", end="", flush=True)
+                elif interrupted:
+                    print("[Response interrupted]", end="", flush=True)
                 print("\n", flush=True)
             except Exception as e:
                 logger.exception("Error while receiving response: %s", e)

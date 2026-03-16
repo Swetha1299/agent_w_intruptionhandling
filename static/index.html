@@ -181,7 +181,6 @@
     }
     #msg-input:focus   { border-color: #4285f4; }
     #msg-input::placeholder { color: #444; }
-    #msg-input:disabled { opacity: .4; cursor: not-allowed; }
 
     #send-btn {
       width: 42px; height: 42px;
@@ -198,6 +197,23 @@
     #send-btn:active  { transform: scale(.93); }
     #send-btn:disabled{ background: #2a2a3a; cursor: not-allowed; }
     #send-btn svg { width: 17px; height: 17px; fill: white; }
+
+    #interrupt-btn {
+      width: 42px; height: 42px;
+      border-radius: 50%;
+      border: none;
+      background: #f44336;
+      color: #fff;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      transition: background .2s, transform .1s;
+      flex-shrink: 0;
+      font-size: 18px;
+    }
+    #interrupt-btn:hover { background: #da190b; }
+    #interrupt-btn:active { transform: scale(.93); }
   </style>
 </head>
 <body>
@@ -219,22 +235,25 @@
   <button id="send-btn" disabled>
     <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
   </button>
+  <button id="interrupt-btn" title="Interrupt the agent">✋</button>
 </div>
 
 <script>
   // ── DOM ──────────────────────────────────────────────────────────────────
-  const chat      = document.getElementById('chat');
-  const input     = document.getElementById('msg-input');
-  const sendBtn   = document.getElementById('send-btn');
-  const statusDot = document.getElementById('status-dot');
-  const statusTxt = document.getElementById('status-text');
-  const modelTag  = document.getElementById('model-tag');
+  const chat         = document.getElementById('chat');
+  const input        = document.getElementById('msg-input');
+  const sendBtn      = document.getElementById('send-btn');
+  const interruptBtn = document.getElementById('interrupt-btn');
+  const statusDot    = document.getElementById('status-dot');
+  const statusTxt    = document.getElementById('status-text');
+  const modelTag     = document.getElementById('model-tag');
 
   // ── State ─────────────────────────────────────────────────────────────────
   let ws               = null;
   let curBubble        = null;   // current Gemini bubble element
   let activeTurn       = null;   // { bubble, waves, pending }
   let turnTimeout      = null;
+  let isStreaming      = false;  // track if agent is responding
 
   // ── Audio ─────────────────────────────────────────────────────────────────
   let audioCtx      = null;
@@ -302,6 +321,8 @@
   function beginGeminiTurn() {
     curBubble     = null;
     nextStartTime = 0;   // reset audio clock for new turn
+    isStreaming   = true;
+    interruptBtn.style.display = 'flex';
 
     const el     = document.createElement('div');
     el.className = 'msg gemini';
@@ -380,6 +401,8 @@
     }
     curBubble = null;
     activeTurn = null;
+    isStreaming = false;
+    interruptBtn.style.display = 'none';
     scrollDown();
   }
 
@@ -421,6 +444,14 @@
         finishGeminiTurn();
         setInputEnabled(true);
       }
+      else if (msg.type === 'interrupted') {
+        finishGeminiTurn();
+        const e = document.createElement('div');
+        e.style.cssText = 'color:#f5a623;font-size:13px;padding:6px 20px;';
+        e.textContent = '⚠ Response interrupted';
+        chat.appendChild(e);
+        setInputEnabled(true);
+      }
       else if (msg.type === 'error') {
         finishGeminiTurn();
         const e = document.createElement('div');
@@ -445,12 +476,22 @@
     if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
     addUserMessage(text);
     input.value = '';
-    setInputEnabled(false);
-    beginGeminiTurn();
-    ws.send(JSON.stringify({ text }));
+    
+    if (!isStreaming) {
+      beginGeminiTurn();
+    }
+    
+    ws.send(JSON.stringify({ type: 'text', text }));
+    input.focus();
+  }
+
+  function interrupt() {
+    if (!isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'interrupt' }));
   }
 
   sendBtn.addEventListener('click', send);
+  interruptBtn.addEventListener('click', interrupt);
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
